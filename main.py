@@ -15,7 +15,7 @@ from langchain.schema import HumanMessage, SystemMessage
 CONFIG = {
     "LOG_FILE": "error_log.txt",
     "SAVE_FILE": "adventure.txt",
-    "DEFAULT_MODEL": "gpt-4o-mini",
+    "DEFAULT_MODEL": "gpt-4.1-mini",
     "REQUEST_TIMEOUT": 120,
     "MAX_CONVERSATION_LENGTH": 10000
 }
