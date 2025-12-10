@@ -1,26 +1,22 @@
 import random
-import requests
-import sounddevice as sd
-import numpy as np
-import os
 import subprocess
+import os
 import datetime
-import time
 import json
 import traceback
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
+
+from langchain_openai import ChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
 
 # ===== CONFIGURATION =====
 CONFIG = {
-    "ALLTALK_API_URL": "http://localhost:7851/api/tts-generate",
-    "OLLAMA_URL": "http://localhost:11434/api/generate",
     "LOG_FILE": "error_log.txt",
     "SAVE_FILE": "adventure.txt",
-    "DEFAULT_MODEL": "llama3:instruct",
+    "DEFAULT_MODEL": "gpt-4-mini",
     "REQUEST_TIMEOUT": 120,
-    "AUDIO_SAMPLE_RATE": 22050,
     "MAX_CONVERSATION_LENGTH": 10000
 }
 
@@ -215,6 +211,7 @@ Never break character as the Dungeon Master. Always continue the adventure.
 class AdventureGame:
     def __init__(self):
         self.state = GameState()
+        self.llm: Optional[ChatOpenAI] = None
         self._audio_lock = threading.Lock()
         self._setup_directories()
         
@@ -244,159 +241,80 @@ class AdventureGame:
         except Exception as e:
             print(f"CRITICAL: Failed to write to error log: {e}")
 
-    def check_server(self, url: str, service_name: str) -> bool:
-        """Generic server health check"""
+    def _validate_openai_credentials(self) -> bool:
+        if os.getenv("OPENAI_API_KEY"):
+            return True
+        print("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
+        return False
+
+    def _create_llm(self, model_name: str) -> ChatOpenAI:
+        return ChatOpenAI(
+            model=model_name,
+            temperature=0.7,
+            timeout=CONFIG["REQUEST_TIMEOUT"],
+            max_retries=2,
+        )
+
+    def _set_model(self, model_name: str) -> bool:
         try:
-            response = requests.get(url, timeout=10)
-            return response.status_code == 200
+            self.llm = self._create_llm(model_name)
+            self.state.current_model = model_name
+            return True
         except Exception as e:
-            self.log_error(f"{service_name} check failed", e)
+            self.log_error(f"Failed to initialize model '{model_name}'", e)
+            print(f"Failed to initialize model '{model_name}'. Please verify the model name and your OpenAI credentials.")
             return False
 
-    def check_ollama_server(self) -> bool:
-        return self.check_server("http://localhost:11434/api/tags", "Ollama")
-
-    def check_alltalk_server(self) -> bool:
-        return self.check_server("http://localhost:7851", "AllTalk")
-
-    def get_installed_models(self) -> List[str]:
-        """Get list of available Ollama models"""
-        try:
-            if not self.check_ollama_server():
-                return []
-
-            result = subprocess.run(
-                ["ollama", "list"], 
-                capture_output=True, 
-                text=True, 
-                check=True,
-                timeout=30
-            )
-            
-            models = []
-            for line in result.stdout.strip().splitlines()[1:]:
-                parts = line.split()
-                if parts:
-                    models.append(parts[0])
-            return models
-            
-        except subprocess.TimeoutExpired:
-            self.log_error("Ollama list command timed out")
-            return []
-        except Exception as e:
-            self.log_error("Error getting installed models", e)
-            return []
+    def _truncate_prompt(self, prompt: str) -> str:
+        if len(prompt) <= CONFIG["MAX_CONVERSATION_LENGTH"]:
+            return prompt
+        recent_conversation = prompt[-4000:]
+        return "[Earlier conversation truncated...]\n" + recent_conversation
 
     def select_model(self) -> str:
-        """Interactive model selection with fallback"""
-        models = self.get_installed_models()
-        
-        if not models:
-            print("No models found. Please enter a model name.")
-            model_input = input(f"Enter Ollama model name [{CONFIG['DEFAULT_MODEL']}]: ").strip()
-            return model_input or CONFIG["DEFAULT_MODEL"]
-
-        print("\nAvailable Ollama models:")
-        for idx, model in enumerate(models, 1):
-            print(f"  {idx}: {model}")
-
-        while True:
-            try:
-                choice = input(f"Select model (1-{len(models)}) or Enter for default [{CONFIG['DEFAULT_MODEL']}]: ").strip()
-                
-                if not choice:
-                    return CONFIG["DEFAULT_MODEL"]
-                
-                idx = int(choice) - 1
-                if 0 <= idx < len(models):
-                    return models[idx]
-                else:
-                    print(f"Please enter a number between 1 and {len(models)}")
-                    
-            except ValueError:
-                print("Please enter a valid number")
-            except KeyboardInterrupt:
-                print("\nUsing default model.")
-                return CONFIG["DEFAULT_MODEL"]
+        """Prompt the user for an OpenAI model name"""
+        print("Using OpenAI via LangChain for story generation.")
+        model_input = input(
+            f"Enter OpenAI model name or press Enter for default [{CONFIG['DEFAULT_MODEL']}]: "
+        ).strip()
+        return model_input or CONFIG["DEFAULT_MODEL"]
 
     def get_ai_response(self, prompt: str) -> str:
         """Get AI response with enhanced error handling and prompt optimization"""
         try:
-            # Truncate conversation if it gets too long to maintain performance
-            if len(prompt) > CONFIG["MAX_CONVERSATION_LENGTH"]:
-                # Keep system prompt and recent conversation
-                system_part = DM_SYSTEM_PROMPT
-                recent_conversation = prompt[-4000:]  # Keep last 4000 characters
-                prompt = system_part + "\n\n[Earlier conversation truncated...]\n" + recent_conversation
+            trimmed_prompt = self._truncate_prompt(prompt)
 
-            response = requests.post(
-                CONFIG["OLLAMA_URL"],
-                json={
-                    "model": self.state.current_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.7,
-                        "stop": ["\n\n", "Player:", "Dungeon Master:"],
-                        "min_p": 0.05,
-                        "top_k": 40,
-                        "top_p": 0.9,
-                        "num_ctx": 4096
-                    }
-                },
-                timeout=CONFIG["REQUEST_TIMEOUT"]
-            )
-            response.raise_for_status()
-            return response.json().get("response", "").strip()
-            
-        except requests.exceptions.Timeout:
-            self.log_error("AI request timed out")
-            return "The world seems to pause as if time has stopped. What would you like to do?"
-        except requests.exceptions.ConnectionError:
-            self.log_error("Cannot connect to Ollama server")
-            return ""
+            if not self.llm and not self._set_model(self.state.current_model):
+                return ""
+
+            response = self.llm.invoke([
+                SystemMessage(content=DM_SYSTEM_PROMPT.strip()),
+                HumanMessage(content=trimmed_prompt)
+            ])
+            ai_text = getattr(response, "content", str(response))
+            return ai_text.strip()
+
         except Exception as e:
+            error_text = str(e).lower()
+            if "timeout" in error_text:
+                self.log_error("AI request timed out", e)
+                return "The world seems to pause as if time has stopped. What would you like to do?"
             self.log_error("Error getting AI response", e)
             return ""
 
-    def speak(self, text: str, voice: str = "FemaleBritishAccent_WhyLucyWhy_Voice_2.wav") -> None:
-        """Non-blocking text-to-speech with improved error handling"""
+    def speak(self, text: str) -> None:
+        """Non-blocking text-to-speech using espeak-ng"""
         if not text.strip():
             return
 
         def _speak_thread():
             with self._audio_lock:
                 try:
-                    if not self.check_alltalk_server():
-                        print("[TTS Server unavailable]")
-                        return
-
-                    payload = {
-                        "text_input": text,
-                        "character_voice_gen": voice,
-                        "narrator_enabled": "true",
-                        "narrator_voice_gen": "narrator.wav",
-                        "text_filtering": "none",
-                        "output_file_name": "output",
-                        "autoplay": "true",
-                        "autoplay_volume": "0.8"
-                    }
-
-                    response = requests.post(CONFIG["ALLTALK_API_URL"], data=payload, timeout=30)
-                    response.raise_for_status()
-
-                    content_type = response.headers.get("Content-Type", "")
-
-                    if content_type.startswith("audio/"):
-                        audio_data = np.frombuffer(response.content, dtype=np.int16)
-                        sd.play(audio_data, samplerate=CONFIG["AUDIO_SAMPLE_RATE"])
-                        sd.wait()
-                    elif content_type.startswith("application/json"):
-                        error_data = response.json()
-                        self.log_error(f"AllTalk API error: {error_data.get('error', 'Unknown error')}")
-                    else:
-                        self.log_error(f"Unexpected AllTalk response type: {content_type}")
-
+                    subprocess.run(["espeak-ng", text], check=True)
+                except FileNotFoundError as e:
+                    self.log_error("espeak-ng command not found", e)
+                except subprocess.CalledProcessError as e:
+                    self.log_error("espeak-ng command failed", e)
                 except Exception as e:
                     self.log_error("Error in TTS", e)
 
@@ -412,7 +330,7 @@ Available commands:
 /redo             - Repeat last AI response with a new generation
 /save             - Save the full adventure to adventure.txt
 /load             - Load the adventure from adventure.txt
-/change           - Switch to a different Ollama model
+/change           - Switch to a different OpenAI model
 /status           - Show current game status
 /exit             - Exit the game
 """)
@@ -475,7 +393,10 @@ Available commands:
             self.state.character_name = metadata.get("character_name", "Alex")
             self.state.selected_genre = metadata.get("genre", "Fantasy")
             self.state.selected_role = metadata.get("role", "Adventurer")
-            self.state.current_model = metadata.get("model", CONFIG["DEFAULT_MODEL"])
+            saved_model = metadata.get("model", CONFIG["DEFAULT_MODEL"])
+            if not self._set_model(saved_model):
+                print(f"Falling back to default model: {CONFIG['DEFAULT_MODEL']}")
+                self._set_model(CONFIG["DEFAULT_MODEL"])
             
             # Extract last AI reply
             last_dm = self.state.conversation.rfind("Dungeon Master:")
@@ -563,8 +484,7 @@ Available commands:
             self.state.conversation = initial_context
             
             # Get first response
-            full_prompt = DM_SYSTEM_PROMPT + "\n\n" + self.state.conversation
-            ai_reply = self.get_ai_response(full_prompt)
+            ai_reply = self.get_ai_response(self.state.conversation)
             if ai_reply:
                 print(f"Dungeon Master: {ai_reply}")
                 self.speak(ai_reply)
@@ -609,7 +529,6 @@ Available commands:
         if self.state.last_ai_reply and self.state.last_player_input:
             self.remove_last_ai_response()
             full_prompt = (
-                f"{DM_SYSTEM_PROMPT}\n\n"
                 f"{self.state.conversation}\n"
                 f"Player: {self.state.last_player_input}\n"
                 "Dungeon Master:"
@@ -627,27 +546,14 @@ Available commands:
 
     def _handle_model_change(self) -> None:
         """Handle model change command"""
-        models = self.get_installed_models()
-        if models:
-            print("Available models:")
-            for idx, model in enumerate(models, 1):
-                print(f"{idx}: {model}")
-            
-            while True:
-                try:
-                    choice = input("Enter number of new model: ").strip()
-                    if not choice:
-                        break
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(models):
-                        self.state.current_model = models[idx]
-                        print(f"Model changed to: {self.state.current_model}")
-                        break
-                    print("Invalid selection.")
-                except ValueError:
-                    print("Please enter a valid number.")
-        else:
-            print("No installed models found.")
+        new_model = input(
+            f"Enter new OpenAI model name or press Enter to keep [{self.state.current_model}]: "
+        ).strip()
+        if not new_model:
+            print("Model unchanged.")
+            return
+        if self._set_model(new_model):
+            print(f"Model changed to: {self.state.current_model}")
 
     def process_player_input(self, user_input: str) -> None:
         """Process regular player input"""
@@ -655,7 +561,6 @@ Available commands:
         formatted_input = f"Player: {user_input}"
         
         prompt = (
-            f"{DM_SYSTEM_PROMPT}\n\n"
             f"{self.state.conversation}\n"
             f"{formatted_input}\n"
             "Dungeon Master:"
@@ -678,17 +583,12 @@ Available commands:
         """Main game loop"""
         print("=== AI Dungeon Master Adventure ===\n")
         
-        # Server checks
-        if not self.check_ollama_server():
-            print("Ollama server not found. Please start it with 'ollama serve'")
-            print("Waiting for Ollama server to start...")
-            time.sleep(3)
-            if not self.check_ollama_server():
-                print("Ollama server still not running. Please start it and try again.")
-                return
-        
-        # Model selection
-        self.state.current_model = self.select_model()
+        if not self._validate_openai_credentials():
+            return
+
+        selected_model = self.select_model()
+        if not self._set_model(selected_model):
+            return
         print(f"Using model: {self.state.current_model}\n")
         
         # Load or start adventure

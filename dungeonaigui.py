@@ -4,9 +4,7 @@ import requests
 import sounddevice as sd
 import numpy as np
 import os
-import subprocess
 import datetime
-import time
 import json
 import traceback
 from pathlib import Path
@@ -19,15 +17,26 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QRegExp, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import QFont, QTextCursor, QPalette, QColor, QTextCharFormat, QSyntaxHighlighter, QRegExpValidator, QIcon, QPainter, QLinearGradient
 
+from langchain_openai import ChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+
 # Configuration
 CONFIG = {
     "ALLTALK_API_URL": "http://localhost:7851/api/tts-generate",
-    "OLLAMA_URL": "http://localhost:11434/api/generate",
     "LOG_FILE": "error_log.txt",
     "SAVE_DIR": "saves",
     "CONFIG_FILE": "config.ini",
     "AUTO_SAVE_INTERVAL": 300000,
+    "DEFAULT_MODEL": "gpt4-mini",
 }
+
+OPENAI_MODEL_SUGGESTIONS = [
+    "gpt4-mini",
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+]
 
 # Role-specific starting scenarios
 ROLE_STARTERS = {
@@ -437,6 +446,8 @@ class AIWorker(QThread):
         self.model = model
         self.temperature = temperature
         self.is_running = True
+        self._llm = None
+        self._llm_model = None
 
     def run(self):
         try:
@@ -451,33 +462,27 @@ class AIWorker(QThread):
             self.error_occurred.emit(f"Error in AI processing: {str(e)}")
 
     def get_ai_response(self, prompt, model):
-        try:
-            response = requests.post(
-                CONFIG["OLLAMA_URL"],
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": self.temperature,
-                        "stop": ["\n\n"],
-                        "min_p": 0.05,
-                        "top_k": 40,
-                        "top_p": 0.9,
-                        "num_predict": 512
-                    }
-                },
-                timeout=120
+        if not os.getenv("OPENAI_API_KEY"):
+            raise Exception("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
+
+        if self._llm is None or self._llm_model != model:
+            self._llm = ChatOpenAI(
+                model=model,
+                temperature=self.temperature,
+                timeout=120,
+                max_retries=2,
             )
-            response.raise_for_status()
-            return response.json().get("response", "").strip()
-        except requests.exceptions.Timeout:
-            raise Exception("AI request timed out after 120 seconds")
-        except requests.exceptions.ConnectionError:
-            raise Exception("Cannot connect to Ollama server. Make sure Ollama is running on localhost:11434")
+            self._llm_model = model
+
+        try:
+            response = self._llm.invoke([
+                SystemMessage(content=DM_SYSTEM_PROMPT.strip()),
+                HumanMessage(content=prompt)
+            ])
+            return getattr(response, "content", str(response)).strip()
         except Exception as e:
             self.log_error("Error in get_ai_response", e)
-            return ""
+            raise
 
     def log_error(self, error_message, exception=None):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -962,36 +967,19 @@ class ModernSetupDialog(QDialog):
             self.role_desc.setText(f"<b>Starting scenario:</b><br>{starter}")
     
     def load_models(self):
-        try:
-            self.model_combo.clear()
-            result = subprocess.run(
-                ["ollama", "list"], capture_output=True, text=True, check=True, timeout=10
-            )
-            lines = result.stdout.strip().splitlines()
-            models = []
-            for line in lines[1:]:
-                parts = line.split()
-                if parts:
-                    model_name = parts[0]
-                    if ':' in model_name:
-                        models.append(model_name)
-            
-            if models:
-                self.model_combo.addItems(models)
-                self.model_combo.setCurrentIndex(0)
-            else:
-                self.model_combo.addItem("llama3:instruct")
-                QMessageBox.warning(self, "Warning", "No Ollama models found. Using default.")
-        except subprocess.TimeoutExpired:
-            self.model_combo.addItem("llama3:instruct")
-            QMessageBox.warning(self, "Warning", "Ollama list command timed out. Using default model.")
-        except Exception as e:
-            self.model_combo.addItem("llama3:instruct")
-            QMessageBox.warning(self, "Warning", f"Could not get installed models: {str(e)}")
+        self.model_combo.clear()
+        for model_name in OPENAI_MODEL_SUGGESTIONS:
+            self.model_combo.addItem(model_name)
+
+        saved_model = self.settings.value("model", CONFIG["DEFAULT_MODEL"])
+        if saved_model and saved_model not in OPENAI_MODEL_SUGGESTIONS:
+            self.model_combo.addItem(saved_model)
+
+        self.model_combo.setCurrentText(saved_model or CONFIG["DEFAULT_MODEL"])
     
     def load_settings(self):
         self.name_edit.setText(self.settings.value("character_name", "Laszlo"))
-        self.model_combo.setCurrentText(self.settings.value("model", "llama3:instruct"))
+        self.model_combo.setCurrentText(self.settings.value("model", CONFIG["DEFAULT_MODEL"]))
         self.genre_combo.setCurrentText(self.settings.value("genre", "Fantasy"))
         self.tts_enabled.setChecked(self.settings.value("tts_enabled", True, type=bool))
         
@@ -1035,7 +1023,7 @@ class AdventureGameGUI(QMainWindow):
         self.last_ai_reply = ""
         self.conversation = ""
         self.last_player_input = ""
-        self.ollama_model = "llama3:instruct"
+        self.model_name = CONFIG["DEFAULT_MODEL"]
         self.character_name = ""
         self.selected_genre = ""
         self.selected_role = ""
@@ -1285,7 +1273,7 @@ class AdventureGameGUI(QMainWindow):
             self.append_text("🎛️ <font color='#FFB74D'>Settings updated.</font><br>")
     
     def apply_settings(self, selections):
-        self.ollama_model = selections["model"]
+        self.model_name = selections["model"]
         self.selected_genre = selections["genre"]
         self.selected_role = selections["role"]
         self.character_name = selections["character_name"]
@@ -1295,7 +1283,7 @@ class AdventureGameGUI(QMainWindow):
         self.max_tokens = selections["max_tokens"]
         
         # Save settings
-        self.settings.setValue("model", self.ollama_model)
+        self.settings.setValue("model", self.model_name)
         self.settings.setValue("genre", self.selected_genre)
         self.settings.setValue("role", self.selected_role)
         self.settings.setValue("character_name", self.character_name)
@@ -1336,7 +1324,7 @@ class AdventureGameGUI(QMainWindow):
         )
         self.conversation = initial_context
         
-        self.get_ai_response(DM_SYSTEM_PROMPT + "\n\n" + self.conversation)
+        self.get_ai_response(self.conversation)
     
     def append_text(self, text):
         self.text_area.moveCursor(QTextCursor.End)
@@ -1361,7 +1349,6 @@ class AdventureGameGUI(QMainWindow):
         
         formatted_input = f"Player: {user_input}"
         prompt = (
-            f"{DM_SYSTEM_PROMPT}\n\n"
             f"{self.conversation}\n"
             f"{formatted_input}\n"
             "Dungeon Master:"
@@ -1390,10 +1377,10 @@ class AdventureGameGUI(QMainWindow):
         elif cmd.startswith('/model'):
             parts = cmd.split()
             if len(parts) > 1:
-                self.ollama_model = parts[1]
-                self.append_text(f"🔄 <font color='#FFA500'>Model changed to: {self.ollama_model}</font><br>")
+                self.model_name = parts[1]
+                self.append_text(f"🔄 <font color='#FFA500'>Model changed to: {self.model_name}</font><br>")
             else:
-                QMessageBox.information(self, "Current Model", f"🤖 Using model: {self.ollama_model}")
+                QMessageBox.information(self, "Current Model", f"🤖 Using model: {self.model_name}")
         elif cmd == '/tts':
             self.tts_enabled = not self.tts_enabled
             status = "enabled" if self.tts_enabled else "disabled"
@@ -1409,7 +1396,7 @@ class AdventureGameGUI(QMainWindow):
         self.progress_bar.setValue(0)
         self.set_ui_enabled(False)
         
-        self.ai_worker = AIWorker(prompt, self.ollama_model, self.temperature)
+        self.ai_worker = AIWorker(prompt, self.model_name, self.temperature)
         self.ai_worker.response_ready.connect(self.handle_ai_response)
         self.ai_worker.error_occurred.connect(self.handle_ai_error)
         self.ai_worker.progress_update.connect(self.progress_bar.setValue)
@@ -1501,7 +1488,6 @@ Be creative and immersive in your descriptions!</p>
             self.conversation = self.conversation[:self.conversation.rfind("Dungeon Master:")].strip()
             
             full_prompt = (
-                f"{DM_SYSTEM_PROMPT}\n\n"
                 f"{self.conversation}\n"
                 f"Player: {self.last_player_input}\n"
                 "Dungeon Master:"

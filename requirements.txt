@@ -2,3 +2,5 @@ requests
 sounddevice
 numpy
 soundfile
+langchain
+langchain-openai
