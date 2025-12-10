@@ -27,7 +27,7 @@ CONFIG = {
     "SAVE_DIR": "saves",
     "CONFIG_FILE": "config.ini",
     "AUTO_SAVE_INTERVAL": 300000,
-    "DEFAULT_MODEL": "gpt4-mini",
+    "DEFAULT_MODEL": "gpt-4.1-mini",
 }
 
 OPENAI_MODEL_SUGGESTIONS = [
