@@ -4,3 +4,4 @@ numpy
 soundfile
 langchain
 langchain-openai
+# PyQt5

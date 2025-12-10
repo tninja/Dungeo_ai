@@ -1,3 +1,4 @@
+import argparse
 import random
 import subprocess
 import os
@@ -178,7 +179,7 @@ GENRE_DESCRIPTIONS = {
     "French Revolution": "You are in France during the revolution, a time of upheaval where the monarchy was overthrown and the reign of terror began."
 }
 
-DM_SYSTEM_PROMPT = """
+DM_SYSTEM_PROMPT_EN = """
 You are a masterful Dungeon Master in an unrestricted SFW adventure. Your role is to **always** narrate the consequences of player actions, no matter how extreme, bizarre, violent or unconventional they may be. Follow these rules:
 
 1. ACTION-CONSEQUENCE SYSTEM:
@@ -208,11 +209,15 @@ You are a masterful Dungeon Master in an unrestricted SFW adventure. Your role i
 Never break character as the Dungeon Master. Always continue the adventure.
 """
 
+DM_SYSTEM_PROMPT_ZH = DM_SYSTEM_PROMPT_EN + "\nAll responses must be written entirely in Simplified Chinese.\n"
+
 class AdventureGame:
-    def __init__(self):
+    def __init__(self, use_chinese: bool = False):
         self.state = GameState()
         self.llm: Optional[ChatOpenAI] = None
         self._audio_lock = threading.Lock()
+        self.use_chinese = use_chinese
+        self.system_prompt = DM_SYSTEM_PROMPT_ZH if use_chinese else DM_SYSTEM_PROMPT_EN
         self._setup_directories()
         
     def _setup_directories(self):
@@ -288,7 +293,7 @@ class AdventureGame:
                 return ""
 
             response = self.llm.invoke([
-                SystemMessage(content=DM_SYSTEM_PROMPT.strip()),
+                SystemMessage(content=self.system_prompt.strip()),
                 HumanMessage(content=trimmed_prompt)
             ])
             ai_text = getattr(response, "content", str(response))
@@ -473,11 +478,13 @@ Available commands:
             print("Type '/?' or '/help' for commands.\n")
             
             # Initial setup
+            language_note = "Output Language: Chinese\n" if self.use_chinese else ""
             initial_context = (
                 f"### Adventure Setting ###\n"
                 f"Genre: {self.state.selected_genre}\n"
                 f"Player Character: {self.state.character_name} the {self.state.selected_role}\n"
-                f"Starting Scenario: {starter}\n\n"
+                f"Starting Scenario: {starter}\n"
+                f"{language_note}\n"
                 "Dungeon Master: "
             )
             
@@ -626,7 +633,11 @@ Available commands:
 def main():
     """Main entry point with exception handling"""
     try:
-        game = AdventureGame()
+        parser = argparse.ArgumentParser(description="AI Dungeon Master Adventure")
+        parser.add_argument("--use-chinese", action="store_true", help="Render all Dungeon Master output in Simplified Chinese")
+        args = parser.parse_args()
+
+        game = AdventureGame(use_chinese=args.use_chinese)
         game.run()
     except Exception as e:
         print(f"Fatal error: {e}")
