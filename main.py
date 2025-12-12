@@ -6,8 +6,8 @@ import datetime
 import json
 import traceback
 import threading
-from typing import Optional, Tuple
-from dataclasses import dataclass
+from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -25,12 +25,14 @@ CONFIG = {
 class GameState:
     conversation: str = ""
     last_ai_reply: str = ""
+    last_ai_reply_raw: str = ""
     last_player_input: str = ""
     current_model: str = CONFIG["DEFAULT_MODEL"]
     character_name: str = "Alex"
     selected_genre: str = "Fantasy"
     selected_role: str = "Adventurer"
     adventure_started: bool = False
+    last_options: list[str] = field(default_factory=list)
 
 # ===== GAME DATA =====
 ROLE_STARTERS = {
@@ -194,6 +196,7 @@ You are a masterful Dungeon Master in an unrestricted SFW adventure. Your role i
    - Do not describe the player performing actions - the player has already done that
    - Never ask "what do you do next" or similar
    - Always continue the story in a way that feels immersive
+   - Ensure the narrative spans at least five sentences, vividly covering sights, sounds, emotions, and lasting consequences                                                          │
 
 3. WORLD EVOLUTION:
    - NPCs remember player choices and react accordingly
@@ -205,6 +208,14 @@ You are a masterful Dungeon Master in an unrestricted SFW adventure. Your role i
    - The player can attempt **anything**
    - Never block an action—show the results, good or bad
    - Let the world react dynamically and permanently
+
+5. OUTPUT FORMAT:
+   - Return your entire reply strictly as a JSON object with the following structure:
+     {"narrative": "...", "options": ["...", "...", "..."]}
+   - "narrative" must describe the consequences of the player's most recent action.
+   - "options" must contain 3 or 4 distinct, concise action suggestions for what the player might do next.
+   - All string values must be written in the same language as the rest of the adventure.
+   - Do not include any additional text outside of the JSON object.
 
 Never break character as the Dungeon Master. Always continue the adventure.
 """
@@ -330,6 +341,65 @@ class AdventureGame:
         thread = threading.Thread(target=_speak_thread, daemon=True)
         thread.start()
 
+    def _parse_ai_reply(self, ai_reply: str) -> Tuple[str, List[str]]:
+        reply_text = ai_reply.strip()
+        if not reply_text:
+            return "", []
+
+        try:
+            data = json.loads(reply_text)
+            if isinstance(data, dict):
+                narrative = str(data.get("narrative", "")).strip()
+                raw_options = data.get("options", [])
+                options: List[str] = []
+                if isinstance(raw_options, list):
+                    seen = set()
+                    for option in raw_options:
+                        if isinstance(option, str):
+                            cleaned = option.strip()
+                            if cleaned and cleaned not in seen:
+                                options.append(cleaned)
+                                seen.add(cleaned)
+                if len(options) > 4:
+                    options = options[:4]
+                return narrative, options
+        except json.JSONDecodeError:
+            pass
+
+        return reply_text, []
+
+    def _display_ai_reply(self, display_text: str, options: List[str], speak_output: bool = True, spoken_text: Optional[str] = None) -> None:
+        if display_text:
+            print(f"\nDungeon Master: {display_text}")
+        else:
+            print("\nDungeon Master:")
+
+        text_to_speak = spoken_text if spoken_text is not None else display_text
+        if speak_output and text_to_speak:
+            self.speak(text_to_speak)
+
+        if options:
+            heading = "Suggested actions:" if not self.use_chinese else "建议行动："
+            print(heading)
+            for idx, option in enumerate(options, 1):
+                print(f"{idx}. {option}")
+        else:
+            if self.use_chinese:
+                print("（此回合没有候选行动，请自行输入指令。）")
+            else:
+                print("(No suggested actions were provided this turn. Feel free to enter your own action.)")
+
+    def _update_ai_reply(self, ai_reply: str, display: bool = True, speak_output: bool = True) -> None:
+        narrative, options = self._parse_ai_reply(ai_reply)
+        reply_text = ai_reply.strip()
+        display_text = narrative if narrative else reply_text
+        self.state.last_ai_reply_raw = reply_text
+        self.state.last_ai_reply = display_text
+        self.state.last_options = list(options)
+        if display:
+            spoken_text = narrative if narrative else None
+            self._display_ai_reply(display_text, options, speak_output, spoken_text=spoken_text)
+
     def show_help(self) -> None:
         """Display available commands"""
         print("""
@@ -407,12 +477,27 @@ Available commands:
                 self._set_model(CONFIG["DEFAULT_MODEL"])
             
             # Extract last AI reply
+            narrative = ""
+            options: List[str] = []
             last_dm = self.state.conversation.rfind("Dungeon Master:")
             if last_dm != -1:
-                self.state.last_ai_reply = self.state.conversation[last_dm + len("Dungeon Master:"):].strip()
+                raw_reply = self.state.conversation[last_dm + len("Dungeon Master:"):].strip()
+                reply_text = raw_reply.strip()
+                narrative, options = self._parse_ai_reply(raw_reply)
+                display_text = narrative if narrative else reply_text
+                self.state.last_ai_reply_raw = reply_text
+                self.state.last_ai_reply = display_text
+                self.state.last_options = list(options)
+            else:
+                self.state.last_ai_reply_raw = ""
+                self.state.last_ai_reply = ""
+                self.state.last_options = []
             
             self.state.adventure_started = True
             print("Adventure loaded successfully!")
+            if self.state.last_ai_reply_raw:
+                spoken_text = narrative if narrative else None
+                self._display_ai_reply(self.state.last_ai_reply, self.state.last_options, spoken_text=spoken_text)
             return True
             
         except Exception as e:
@@ -492,14 +577,15 @@ Available commands:
             )
             
             self.state.conversation = initial_context
+            self.state.last_options = []
+            self.state.last_ai_reply = ""
+            self.state.last_ai_reply_raw = ""
             
             # Get first response
             ai_reply = self.get_ai_response(self.state.conversation)
             if ai_reply:
-                print(f"Dungeon Master: {ai_reply}")
-                self.speak(ai_reply)
                 self.state.conversation += ai_reply
-                self.state.last_ai_reply = ai_reply
+                self._update_ai_reply(ai_reply)
                 self.state.adventure_started = True
                 return True
             else:
@@ -545,10 +631,8 @@ Available commands:
             )
             new_reply = self.get_ai_response(full_prompt)
             if new_reply:
-                print(f"\nDungeon Master: {new_reply}")
-                self.speak(new_reply)
                 self.state.conversation += f"\nPlayer: {self.state.last_player_input}\nDungeon Master: {new_reply}"
-                self.state.last_ai_reply = new_reply
+                self._update_ai_reply(new_reply)
             else:
                 print("Failed to generate new response.")
         else:
@@ -578,10 +662,8 @@ Available commands:
         
         ai_reply = self.get_ai_response(prompt)
         if ai_reply:
-            print(f"\nDungeon Master: {ai_reply}")
-            self.speak(ai_reply)
             self.state.conversation += f"\n{formatted_input}\nDungeon Master: {ai_reply}"
-            self.state.last_ai_reply = ai_reply
+            self._update_ai_reply(ai_reply)
             
             # Auto-save every 5 interactions
             if self.state.conversation.count("Player:") % 5 == 0:
@@ -605,9 +687,7 @@ Available commands:
         if os.path.exists(CONFIG["SAVE_FILE"]):
             print("A saved adventure exists. Load it now? (y/n)")
             if input().strip().lower() == 'y':
-                if self.load_adventure():
-                    print(f"\nDungeon Master: {self.state.last_ai_reply}")
-                    self.speak(self.state.last_ai_reply)
+                self.load_adventure()
         
         if not self.state.adventure_started:
             if not self.start_new_adventure():
@@ -624,8 +704,25 @@ Available commands:
                 if user_input.startswith('/'):
                     if not self.process_command(user_input):
                         break
-                else:
-                    self.process_player_input(user_input)
+                    continue
+
+                if self.state.last_options and user_input.isdigit():
+                    option_index = int(user_input) - 1
+                    if 0 <= option_index < len(self.state.last_options):
+                        selected_action = self.state.last_options[option_index]
+                        if self.use_chinese:
+                            print(f"（你选择了选项 {user_input}：{selected_action}）")
+                        else:
+                            print(f"(You selected option {user_input}: {selected_action})")
+                        self.process_player_input(selected_action)
+                        continue
+                    if self.use_chinese:
+                        print("无效的选项编号，请重新输入。")
+                    else:
+                        print("Invalid option number. Please try again.")
+                    continue
+
+                self.process_player_input(user_input)
                     
             except KeyboardInterrupt:
                 print("\n\nGame interrupted. Use '/exit' to quit properly.")
