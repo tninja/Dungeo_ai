@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # ===== CONFIGURATION =====
 CONFIG = {
@@ -212,11 +212,12 @@ Never break character as the Dungeon Master. Always continue the adventure.
 DM_SYSTEM_PROMPT_ZH = DM_SYSTEM_PROMPT_EN + "\nAll responses must be written entirely in Simplified Chinese.\n"
 
 class AdventureGame:
-    def __init__(self, use_chinese: bool = False):
+    def __init__(self, use_chinese: bool = False, enable_tts: bool = False):
         self.state = GameState()
         self.llm: Optional[ChatOpenAI] = None
         self._audio_lock = threading.Lock()
         self.use_chinese = use_chinese
+        self.tts_enabled = enable_tts
         self.system_prompt = DM_SYSTEM_PROMPT_ZH if use_chinese else DM_SYSTEM_PROMPT_EN
         self._setup_directories()
         
@@ -309,6 +310,8 @@ class AdventureGame:
 
     def speak(self, text: str) -> None:
         """Non-blocking text-to-speech using espeak-ng"""
+        if not self.tts_enabled:
+            return
         if not text.strip():
             return
 
@@ -635,9 +638,10 @@ def main():
     try:
         parser = argparse.ArgumentParser(description="AI Dungeon Master Adventure")
         parser.add_argument("--use-chinese", action="store_true", help="Render all Dungeon Master output in Simplified Chinese")
+        parser.add_argument("--enable-tts", action="store_true", help="Enable text-to-speech narration using espeak-ng")
         args = parser.parse_args()
 
-        game = AdventureGame(use_chinese=args.use_chinese)
+        game = AdventureGame(use_chinese=args.use_chinese, enable_tts=args.enable_tts)
         game.run()
     except Exception as e:
         print(f"Fatal error: {e}")
